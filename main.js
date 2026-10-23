@@ -1,21 +1,27 @@
-const { Plugin, TFile, TFolder } = require("obsidian");
+const { Plugin, TFile, TFolder, Vault } = require("obsidian");
 
 // Each Claude Code project directory becomes the hub for its memories and
 // session logs. Each session links to the subagent transcripts Claude Code
 // writes to <session>/subagents/agent-*.jsonl, each subagent to its
 // agent-*.meta.json, and each persisted tool result to the log that produced it.
+// Workflow runs write their agents and journal to
+// <session>/subagents/workflows/wf_*/ and their run record and script to
+// <session>/workflows/, all named by run id, so each run folder sits between
+// the session and those files to keep a run grouped.
 //
 // Obsidian's graph only draws edges from Markdown links and only draws nodes
-// for paths in the metadata cache, so we inject both directly. Project folders
-// are added to the in-memory file cache to render as nodes; writing the entry
-// directly (rather than through saveFileCache) keeps it out of the persisted
-// IndexedDB cache.
+// for paths in the metadata cache, so we inject both directly. Project and
+// workflow run folders are added to the in-memory file cache to render as
+// nodes; writing the entry directly (rather than through saveFileCache) keeps
+// it out of the persisted IndexedDB cache.
 //
 // Graph color groups never apply to attachments, which covers every node type
 // here, so node colors are assigned as the data reaches each graph renderer.
 
 const COLORS = {
   project: 0xf5a623,
+  workflow: 0xec4899,
+  workflowFile: 0xf9a8d4,
   session: 0x3b82f6,
   subagent: 0x8b5cf6,
   meta: 0x14b8a6,
@@ -76,15 +82,27 @@ module.exports = class ClaudeCodeGraph extends Plugin {
     return { sessionDir: `${parts[0]}/${parts[1]}`, anchor: `tool-results/${parts[3]}` };
   }
 
-  category(path) {
-    if (this.injectedNodes.has(path)) return "project";
+  workflowParts(path) {
     const parts = path.split("/");
+    const sessionDir = `${parts[0]}/${parts[1]}`;
+    let runId = null;
+    if (parts.length === 6 && parts[2] === "subagents" && parts[3] === "workflows") runId = parts[4];
+    else if (parts.length === 4 && parts[2] === "workflows") runId = parts[3].match(/^(wf_[^.]+)\.json$/)?.[1];
+    else if (parts.length === 5 && parts[2] === "workflows" && parts[3] === "scripts") runId = parts[4].match(/-(wf_[^.]+)\.js$/)?.[1];
+    if (!runId) return null;
+    return { sessionPath: `${sessionDir}.jsonl`, run: `${sessionDir}/subagents/workflows/${runId}` };
+  }
+
+  category(path) {
+    const parts = path.split("/");
+    if (this.injectedNodes.has(path)) return parts.length === 1 ? "project" : "workflow";
     const name = parts[parts.length - 1];
     if (parts.length === 2 && name.endsWith(".jsonl")) return "session";
-    if (parts[parts.length - 2] === "subagents" && name.startsWith("agent-")) {
+    if ((parts[parts.length - 2] === "subagents" || this.workflowParts(path)) && name.startsWith("agent-")) {
       if (name.endsWith(".meta.json")) return "meta";
       if (name.endsWith(".jsonl")) return "subagent";
     }
+    if (this.workflowParts(path)) return "workflowFile";
     if (this.toolResultParts(path)) return "toolResult";
     return null;
   }
@@ -111,9 +129,12 @@ module.exports = class ClaudeCodeGraph extends Plugin {
       let found = false;
       for (const [sessionDir, items] of pending) {
         const subagentsDir = this.app.vault.getAbstractFileByPath(`${sessionDir}/subagents`);
-        const logs = subagentsDir instanceof TFolder
-          ? subagentsDir.children.filter((f) => f instanceof TFile && f.extension === "jsonl").map((f) => f.path)
-          : [];
+        const logs = [];
+        if (subagentsDir instanceof TFolder) {
+          Vault.recurseChildren(subagentsDir, (f) => {
+            if (f instanceof TFile && f.extension === "jsonl" && f.name.startsWith("agent-")) logs.push(f.path);
+          });
+        }
         logs.push(`${sessionDir}.jsonl`);
 
         const remaining = new Set(items);
@@ -175,12 +196,14 @@ module.exports = class ClaudeCodeGraph extends Plugin {
       links.get(source).add(target);
     };
     const isFile = (path) => this.app.vault.getAbstractFileByPath(path) instanceof TFile;
+    const isFolder = (path) => this.app.vault.getAbstractFileByPath(path) instanceof TFolder;
 
     for (const file of this.app.vault.getFiles()) {
       const parts = file.path.split("/");
       if (parts.length < 2) continue;
       const project = parts[0];
       const tr = this.toolResultParts(file.path);
+      const wf = this.workflowParts(file.path);
 
       if (parts.length === 2 && file.extension === "jsonl") {
         add(project, file.path);
@@ -189,9 +212,14 @@ module.exports = class ClaudeCodeGraph extends Plugin {
       } else if (file.extension === "jsonl" && file.name.startsWith("agent-") && parts[parts.length - 2] === "subagents") {
         const sessionPath = parts.slice(0, -2).join("/") + ".jsonl";
         if (isFile(sessionPath)) add(sessionPath, file.path);
-      } else if (file.name.startsWith("agent-") && file.name.endsWith(".meta.json") && parts[parts.length - 2] === "subagents") {
+      } else if (file.name.startsWith("agent-") && file.name.endsWith(".meta.json") && (parts[parts.length - 2] === "subagents" || wf)) {
         const agentPath = file.path.slice(0, -".meta.json".length) + ".jsonl";
         if (isFile(agentPath)) add(agentPath, file.path);
+      } else if (wf) {
+        if (isFile(wf.sessionPath) && isFolder(wf.run)) {
+          add(wf.sessionPath, wf.run);
+          add(wf.run, file.path);
+        }
       } else if (tr) {
         // Until the producing log is found, the session folder is the best
         // known origin.

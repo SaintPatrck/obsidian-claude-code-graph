@@ -13,10 +13,17 @@ Project
     ├── Subagent logs (<session>/subagents/agent-*.jsonl)
     │   ├── Subagent metadata (agent-*.meta.json)
     │   └── Tool results produced by that subagent
+    ├── Workflow runs (<session>/subagents/workflows/wf_*)
+    │   ├── Run record (<session>/workflows/wf_*.json)
+    │   ├── Run script (<session>/workflows/scripts/*-wf_*.js)
+    │   ├── Run journal (journal.jsonl)
+    │   └── Workflow agent logs (agent-*.jsonl)
+    │       ├── Agent metadata (agent-*.meta.json)
+    │       └── Tool results produced by that agent
     └── Tool results produced by the main session
 ```
 
-Each project directory appears as its own hub node. Tool results are matched to the transcript that recorded their saved path, so output produced by a subagent attaches to that subagent instead of the session that spawned it. A newly written tool result attaches to its session until its producing log is found a few seconds later.
+Each project directory and workflow run folder appears as its own hub node, so a run's agents stay grouped under the session that started it. Tool results are matched to the transcript that recorded their saved path, so output produced by a subagent attaches to that subagent instead of the session that spawned it. A newly written tool result attaches to its session until its producing log is found a few seconds later.
 
 ## Colors
 
@@ -25,9 +32,11 @@ Obsidian's graph color groups don't apply to attachments, which covers every fil
 | Node | Color |
 |---|---|
 | Project | Amber |
+| Workflow run | Pink |
+| Run record, script, or journal | Light pink |
 | Session | Blue |
-| Subagent | Violet |
-| Subagent metadata | Teal |
+| Subagent or workflow agent | Violet |
+| Agent metadata | Teal |
 | Tool result | Slate |
 
 Memory notes are left alone, so graph color groups still work for them. To change the palette, edit the `COLORS` block at the top of `main.js`.
