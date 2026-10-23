@@ -3,7 +3,7 @@ const { Plugin, TFile, TFolder, Vault } = require("obsidian");
 // Each Claude Code project directory becomes the hub for its memories and
 // session logs. Each session links to the subagent transcripts Claude Code
 // writes to <session>/subagents/agent-*.jsonl, each subagent to its
-// agent-*.meta.json, and each persisted tool result to the log that produced it.
+// agent-*.json sidecars (metadata, forked skill), and each persisted tool result to the log that produced it.
 // Memory notes also link from every transcript that wrote to them.
 // Workflow runs write their agents and journal to
 // <session>/subagents/workflows/wf_*/ and their run record and script to
@@ -134,7 +134,7 @@ module.exports = class ClaudeCodeGraph extends Plugin {
     const name = parts[parts.length - 1];
     if (parts.length === 2 && name.endsWith(".jsonl")) return "session";
     if ((parts[parts.length - 2] === "subagents" || this.workflowParts(path)) && name.startsWith("agent-")) {
-      if (name.endsWith(".meta.json")) return "meta";
+      if (name.endsWith(".json")) return "meta";
       if (name.endsWith(".jsonl")) return "subagent";
     }
     if (this.workflowParts(path)) return "workflowFile";
@@ -143,7 +143,7 @@ module.exports = class ClaudeCodeGraph extends Plugin {
   }
 
   async loadAgentTypes() {
-    const metas = this.app.vault.getFiles().filter((f) => this.category(f.path) === "meta");
+    const metas = this.app.vault.getFiles().filter((f) => f.name.endsWith(".meta.json") && this.category(f.path) === "meta");
     await Promise.all(metas.map((f) => this.readAgentType(f.path)));
     this.sync();
   }
@@ -151,7 +151,7 @@ module.exports = class ClaudeCodeGraph extends Plugin {
   async readAgentType(metaPath) {
     try {
       const { agentType } = JSON.parse(await this.app.vault.adapter.read(metaPath));
-      if (agentType) this.agentTypes.set(metaPath.slice(0, -".meta.json".length) + ".jsonl", agentType);
+      if (agentType) this.agentTypes.set(this.agentLogFor(metaPath), agentType);
     } catch {
       // A metadata file caught mid-write keeps its agent's default color.
     }
@@ -228,6 +228,11 @@ module.exports = class ClaudeCodeGraph extends Plugin {
       }
     }
     this.sync();
+  }
+
+  agentLogFor(sidecarPath) {
+    const slash = sidecarPath.lastIndexOf("/");
+    return `${sidecarPath.slice(0, slash + 1)}${sidecarPath.slice(slash + 1).split(".")[0]}.jsonl`;
   }
 
   color(path, category) {
@@ -369,8 +374,8 @@ module.exports = class ClaudeCodeGraph extends Plugin {
       } else if (file.extension === "jsonl" && file.name.startsWith("agent-") && parts[parts.length - 2] === "subagents") {
         const sessionPath = parts.slice(0, -2).join("/") + ".jsonl";
         if (isFile(sessionPath)) add(sessionPath, file.path);
-      } else if (file.name.startsWith("agent-") && file.name.endsWith(".meta.json") && (parts[parts.length - 2] === "subagents" || wf)) {
-        const agentPath = file.path.slice(0, -".meta.json".length) + ".jsonl";
+      } else if (file.name.startsWith("agent-") && file.extension === "json" && (parts[parts.length - 2] === "subagents" || wf)) {
+        const agentPath = this.agentLogFor(file.path);
         if (isFile(agentPath)) add(agentPath, file.path);
       } else if (wf) {
         if (isFile(wf.sessionPath) && isFolder(wf.run)) {
