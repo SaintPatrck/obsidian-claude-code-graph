@@ -11,7 +11,7 @@ Project
 ├── Memories (memory/*.md), also linked from each transcript that wrote them
 └── Session logs (<session>.jsonl)
     ├── Subagent logs (<session>/subagents/agent-*.jsonl)
-    │   ├── Subagent metadata (agent-*.meta.json)
+    │   ├── Subagent metadata and sidecars (agent-*.meta.json, agent-*.forked-skill.json)
     │   └── Tool results produced by that subagent
     ├── Workflow runs (<session>/subagents/workflows/wf_*)
     │   ├── Run record (<session>/workflows/wf_*.json)
@@ -39,7 +39,7 @@ Obsidian's graph color groups don't apply to attachments, which covers every fil
 | Workflow agent | Lavender |
 | Explore or Plan agent | Cyan |
 | Plugin agent (any `plugin:agent` type) | Red |
-| Agent metadata | Teal |
+| Agent metadata or sidecar | Teal |
 | Tool result | Slate |
 
 Memory notes are left alone, so graph color groups still work for them. Subagents are colored by the `agentType` recorded in their metadata. To change the palette, edit the `COLORS` and `AGENT_COLORS` blocks at the top of `main.js`.
