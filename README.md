@@ -8,7 +8,7 @@ Claude Code stores each project's memories, session transcripts, subagent transc
 
 ```
 Project
-├── Memories (memory/*.md)
+├── Memories (memory/*.md), also linked from each transcript that wrote them
 └── Session logs (<session>.jsonl)
     ├── Subagent logs (<session>/subagents/agent-*.jsonl)
     │   ├── Subagent metadata (agent-*.meta.json)
@@ -23,7 +23,7 @@ Project
     └── Tool results produced by the main session
 ```
 
-Each project directory and workflow run folder appears as its own hub node, so a run's agents stay grouped under the session that started it. Tool results are matched to the transcript that recorded their saved path, so output produced by a subagent attaches to that subagent instead of the session that spawned it. A newly written tool result attaches to its session until its producing log is found a few seconds later.
+Each project directory and workflow run folder appears as its own hub node, so a run's agents stay grouped under the session that started it. Tool results are matched to the transcript that recorded their saved path, so output produced by a subagent attaches to that subagent instead of the session that spawned it. A newly written tool result attaches to its session until its producing log is found a few seconds later. Memory notes link to every session or subagent whose transcript wrote or edited them, as far back as Claude Code keeps transcripts. The first scan reads every transcript and can take a while on a large history; the results are cached in the plugin's `data.json`, so later scans only read logs that have changed.
 
 ## Colors
 
@@ -58,7 +58,7 @@ Open `~/.claude/projects` as an Obsidian vault, then install with [BRAT](https:/
 
 To install manually instead, download `main.js` and `manifest.json` from the latest release into `~/.claude/projects/.obsidian/plugins/claude-code-graph/` and enable the plugin.
 
-In the graph view's Filters, enable Attachments so transcript and tool-output nodes are shown.
+In the graph view's Filters, enable Attachments so transcript and tool-output nodes are shown. The local graph keeps its own filters, so enable Attachments there too to see the sessions linked to a memory note.
 
 ## How it works
 

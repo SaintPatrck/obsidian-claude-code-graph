@@ -4,6 +4,7 @@ const { Plugin, TFile, TFolder, Vault } = require("obsidian");
 // session logs. Each session links to the subagent transcripts Claude Code
 // writes to <session>/subagents/agent-*.jsonl, each subagent to its
 // agent-*.meta.json, and each persisted tool result to the log that produced it.
+// Memory notes also link from every transcript that wrote to them.
 // Workflow runs write their agents and journal to
 // <session>/subagents/workflows/wf_*/ and their run record and script to
 // <session>/workflows/, all named by run id, so each run folder sits between
@@ -39,6 +40,15 @@ const AGENT_COLORS = {
 
 const ORIGIN_RETRY_DELAY_MS = 5000;
 const TRANSCRIPT_BYTES_PER_WEIGHT = 256 * 1024;
+const MEMORY_SCAN_DELAY_MS = 2000;
+// Each await can wait out a frame of a busy graph view, so transcripts are
+// read several at a time, and results are saved and applied per batch.
+const SCAN_CONCURRENCY = 8;
+const SCAN_BATCH_SIZE = 200;
+// Bump when the fields extracted per transcript change, so stale entries are
+// read again instead of trusted.
+const TRANSCRIPT_CACHE_VERSION = 1;
+const MEMORY_WRITE = /"name":"(?:Write|Edit|MultiEdit)","input":\{"file_path":"([^"]+\/memory\/[^"/]+\.md)"/g;
 
 module.exports = class ClaudeCodeGraph extends Plugin {
   async onload() {
@@ -46,6 +56,7 @@ module.exports = class ClaudeCodeGraph extends Plugin {
     this.injectedNodes = new Map();
     this.origins = new Map();
     this.agentTypes = new Map();
+    this.memoryWriters = new Map();
     this.patchedRenderers = new Map();
     this.syncing = false;
 
@@ -54,8 +65,12 @@ module.exports = class ClaudeCodeGraph extends Plugin {
       this.sync();
       this.resolveOrigins();
       this.loadAgentTypes();
+      this.scanMemoryWrites();
       this.registerEvent(this.app.metadataCache.on("resolved", () => this.sync()));
       this.registerEvent(this.app.vault.on("create", (file) => this.onCreate(file)));
+      this.registerEvent(this.app.vault.on("modify", (file) => {
+        if (this.isMemory(file.path)) this.scheduleMemoryScan();
+      }));
       this.registerEvent(this.app.vault.on("delete", (file) => this.onRemove(file.path)));
       this.registerEvent(this.app.vault.on("rename", (file, oldPath) => this.onRemove(oldPath, file)));
       this.registerEvent(this.app.workspace.on("layout-change", () => {
@@ -66,6 +81,7 @@ module.exports = class ClaudeCodeGraph extends Plugin {
 
   onunload() {
     clearTimeout(this.originTimer);
+    clearTimeout(this.memoryTimer);
     for (const [renderer, setData] of this.patchedRenderers) renderer.setData = setData;
     this.patchedRenderers.clear();
     this.clear();
@@ -79,6 +95,7 @@ module.exports = class ClaudeCodeGraph extends Plugin {
       clearTimeout(this.originTimer);
       this.originTimer = setTimeout(() => this.resolveOrigins(), ORIGIN_RETRY_DELAY_MS);
     }
+    if (this.isMemory(file.path)) this.scheduleMemoryScan();
     if (this.category(file.path) === "meta") this.readAgentType(file.path).then(() => this.sync());
     else this.sync();
   }
@@ -93,6 +110,11 @@ module.exports = class ClaudeCodeGraph extends Plugin {
     const parts = path.split("/");
     if (parts.length < 4 || parts[2] !== "tool-results") return null;
     return { sessionDir: `${parts[0]}/${parts[1]}`, anchor: `tool-results/${parts[3]}` };
+  }
+
+  isMemory(path) {
+    const parts = path.split("/");
+    return parts.length === 3 && parts[1] === "memory" && path.endsWith(".md");
   }
 
   workflowParts(path) {
@@ -133,6 +155,79 @@ module.exports = class ClaudeCodeGraph extends Plugin {
     } catch {
       // A metadata file caught mid-write keeps its agent's default color.
     }
+  }
+
+  scheduleMemoryScan() {
+    clearTimeout(this.memoryTimer);
+    this.memoryTimer = setTimeout(() => this.scanMemoryWrites(), MEMORY_SCAN_DELAY_MS);
+  }
+
+  // Reading every transcript is slow, so each log's memory writes are cached
+  // in plugin data and a log is only read again once its size or mtime moves.
+  // Batches are saved as they finish, so links appear while a cold scan runs
+  // and a scan cut short keeps its progress.
+  async scanMemoryWrites() {
+    if (this.scanning) {
+      this.scanAgain = true;
+      return;
+    }
+    const base = this.app.vault.adapter.getBasePath?.();
+    if (!base) return;
+    this.scanning = true;
+    try {
+      const data = (await this.loadData()) ?? {};
+      const cached = data.transcripts?.version === TRANSCRIPT_CACHE_VERSION ? data.transcripts.logs : {};
+      const scanned = {};
+      const stale = [];
+      for (const file of this.app.vault.getFiles()) {
+        const category = this.category(file.path);
+        if (category !== "session" && category !== "subagent") continue;
+        const hit = cached[file.path];
+        if (hit && hit.size === file.stat.size && hit.mtime === file.stat.mtime) scanned[file.path] = hit;
+        else stale.push(file);
+      }
+      this.applyScan(scanned);
+
+      for (let i = 0; i < stale.length; i += SCAN_BATCH_SIZE) {
+        const batch = stale.slice(i, i + SCAN_BATCH_SIZE);
+        for (let j = 0; j < batch.length; j += SCAN_CONCURRENCY) {
+          await Promise.all(batch.slice(j, j + SCAN_CONCURRENCY).map(async (file) => {
+            scanned[file.path] = await this.scanTranscript(file, base);
+          }));
+        }
+        await this.saveData({ ...data, transcripts: { version: TRANSCRIPT_CACHE_VERSION, logs: scanned } });
+        this.applyScan(scanned);
+      }
+    } finally {
+      this.scanning = false;
+    }
+    if (this.scanAgain) {
+      this.scanAgain = false;
+      this.scanMemoryWrites();
+    }
+  }
+
+  async scanTranscript(file, base) {
+    const { size, mtime } = file.stat;
+    const content = await this.app.vault.adapter.read(file.path);
+    const targets = new Set();
+    if (content.includes("/memory/")) {
+      for (const [, target] of content.matchAll(MEMORY_WRITE)) {
+        if (target.startsWith(`${base}/`)) targets.add(target.slice(base.length + 1));
+      }
+    }
+    return { size, mtime, targets: [...targets] };
+  }
+
+  applyScan(scanned) {
+    this.memoryWriters = new Map();
+    for (const [log, { targets }] of Object.entries(scanned)) {
+      for (const target of targets) {
+        if (!this.memoryWriters.has(target)) this.memoryWriters.set(target, new Set());
+        this.memoryWriters.get(target).add(log);
+      }
+    }
+    this.sync();
   }
 
   color(path, category) {
@@ -266,8 +361,11 @@ module.exports = class ClaudeCodeGraph extends Plugin {
 
       if (parts.length === 2 && file.extension === "jsonl") {
         add(project, file.path);
-      } else if (parts.length === 3 && parts[1] === "memory" && file.extension === "md") {
+      } else if (this.isMemory(file.path)) {
         add(project, file.path);
+        for (const writer of this.memoryWriters.get(file.path) ?? []) {
+          if (isFile(writer)) add(writer, file.path);
+        }
       } else if (file.extension === "jsonl" && file.name.startsWith("agent-") && parts[parts.length - 2] === "subagents") {
         const sessionPath = parts.slice(0, -2).join("/") + ".jsonl";
         if (isFile(sessionPath)) add(sessionPath, file.path);
