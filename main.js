@@ -41,6 +41,9 @@ const AGENT_COLORS = {
 const ORIGIN_RETRY_DELAY_MS = 5000;
 const TRANSCRIPT_BYTES_PER_WEIGHT = 256 * 1024;
 const MEMORY_SCAN_DELAY_MS = 2000;
+// Bump when the fields extracted per transcript change, so stale entries are
+// read again instead of trusted.
+const TRANSCRIPT_CACHE_VERSION = 1;
 const MEMORY_WRITE = /"name":"(?:Write|Edit|MultiEdit)","input":\{"file_path":"([^"]+\/memory\/[^"/]+\.md)"/g;
 
 module.exports = class ClaudeCodeGraph extends Plugin {
@@ -167,7 +170,7 @@ module.exports = class ClaudeCodeGraph extends Plugin {
     this.scanning = true;
     try {
       const data = (await this.loadData()) ?? {};
-      const cached = data.memoryWrites ?? {};
+      const cached = data.transcripts?.version === TRANSCRIPT_CACHE_VERSION ? data.transcripts.logs : {};
       const scanned = {};
       for (const file of this.app.vault.getFiles()) {
         const category = this.category(file.path);
@@ -187,7 +190,7 @@ module.exports = class ClaudeCodeGraph extends Plugin {
         }
         scanned[file.path] = { size, mtime, targets: [...targets] };
       }
-      await this.saveData({ ...data, memoryWrites: scanned });
+      await this.saveData({ ...data, transcripts: { version: TRANSCRIPT_CACHE_VERSION, logs: scanned } });
 
       this.memoryWriters = new Map();
       for (const [log, { targets }] of Object.entries(scanned)) {
