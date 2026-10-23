@@ -308,6 +308,21 @@ module.exports = class ClaudeCodeGraph extends Plugin {
     return first;
   }
 
+  // A project whose sessions were all deleted has no cwd, but its folder
+  // usually extends a known project's encoded path, so the remainder is the
+  // directory name beneath it.
+  inferProjectPaths(cwds) {
+    const known = [...cwds.values()].map((cwd) => [cwd, cwd.replace(/[^a-zA-Z0-9]/g, "-")]);
+    for (const folder of this.app.vault.getRoot().children) {
+      if (!(folder instanceof TFolder) || folder.name.startsWith(".") || cwds.has(folder.name)) continue;
+      let best = null;
+      for (const [cwd, encoded] of known) {
+        if (folder.name.startsWith(`${encoded}-`) && (!best || encoded.length > best[1].length)) best = [cwd, encoded];
+      }
+      if (best) cwds.set(folder.name, `${best[0]}/${folder.name.slice(best[1].length + 1)}`);
+    }
+  }
+
   // Projects are named by their directory, with a worktree's name alongside
   // its repo, and widened to the parent directory when two names collide.
   nameProjects(cwds) {
@@ -341,6 +356,7 @@ module.exports = class ClaudeCodeGraph extends Plugin {
         this.memoryWriters.get(target).add(log);
       }
     }
+    this.inferProjectPaths(cwds);
     this.projectNames = this.nameProjects(cwds);
     this.sync();
   }
