@@ -26,6 +26,15 @@ const COLORS = {
   subagent: 0x8b5cf6,
   meta: 0x14b8a6,
   toolResult: 0x94a3b8,
+  pluginAgent: 0xef4444,
+};
+
+// Subagents are colored by the agentType in their metadata. Types not listed
+// fall back to pluginAgent when namespaced by a plugin, otherwise subagent.
+const AGENT_COLORS = {
+  "workflow-subagent": 0x6366f1,
+  Explore: 0x22d3ee,
+  Plan: 0x22d3ee,
 };
 
 const ORIGIN_RETRY_DELAY_MS = 5000;
@@ -35,6 +44,7 @@ module.exports = class ClaudeCodeGraph extends Plugin {
     this.injectedLinks = new Map();
     this.injectedNodes = new Map();
     this.origins = new Map();
+    this.agentTypes = new Map();
     this.patchedRenderers = new Map();
     this.syncing = false;
 
@@ -42,6 +52,7 @@ module.exports = class ClaudeCodeGraph extends Plugin {
       this.patchRenderers();
       this.sync();
       this.resolveOrigins();
+      this.loadAgentTypes();
       this.registerEvent(this.app.metadataCache.on("resolved", () => this.sync()));
       this.registerEvent(this.app.vault.on("create", (file) => this.onCreate(file)));
       this.registerEvent(this.app.vault.on("delete", (file) => this.onRemove(file.path)));
@@ -67,7 +78,8 @@ module.exports = class ClaudeCodeGraph extends Plugin {
       clearTimeout(this.originTimer);
       this.originTimer = setTimeout(() => this.resolveOrigins(), ORIGIN_RETRY_DELAY_MS);
     }
-    this.sync();
+    if (this.category(file.path) === "meta") this.readAgentType(file.path).then(() => this.sync());
+    else this.sync();
   }
 
   onRemove(path, renamed) {
@@ -105,6 +117,28 @@ module.exports = class ClaudeCodeGraph extends Plugin {
     if (this.workflowParts(path)) return "workflowFile";
     if (this.toolResultParts(path)) return "toolResult";
     return null;
+  }
+
+  async loadAgentTypes() {
+    const metas = this.app.vault.getFiles().filter((f) => this.category(f.path) === "meta");
+    await Promise.all(metas.map((f) => this.readAgentType(f.path)));
+    this.sync();
+  }
+
+  async readAgentType(metaPath) {
+    try {
+      const { agentType } = JSON.parse(await this.app.vault.adapter.read(metaPath));
+      if (agentType) this.agentTypes.set(metaPath.slice(0, -".meta.json".length) + ".jsonl", agentType);
+    } catch {
+      // A metadata file caught mid-write keeps its agent's default color.
+    }
+  }
+
+  color(path, category) {
+    if (category !== "subagent") return COLORS[category];
+    const type = this.agentTypes.get(path);
+    if (type && Object.hasOwn(AGENT_COLORS, type)) return AGENT_COLORS[type];
+    return type && type.includes(":") ? COLORS.pluginAgent : COLORS.subagent;
   }
 
   // Claude Code records each persisted output's full path in the transcript
@@ -185,7 +219,7 @@ module.exports = class ClaudeCodeGraph extends Plugin {
       const node = data.nodes[id];
       if (node.type !== "attachment") continue;
       const category = this.category(id);
-      if (category) node.color = { a: 1, rgb: COLORS[category] };
+      if (category) node.color = { a: 1, rgb: this.color(id, category) };
     }
   }
 
