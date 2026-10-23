@@ -58,7 +58,7 @@ Open `~/.claude/projects` as an Obsidian vault, then install with [BRAT](https:/
 
 To install manually instead, download `main.js` and `manifest.json` from the latest release into `~/.claude/projects/.obsidian/plugins/claude-code-graph/` and enable the plugin.
 
-In the graph view's Filters, enable Attachments so transcript and tool-output nodes are shown.
+In the graph view's Filters, enable Attachments so transcript and tool-output nodes are shown. The local graph keeps its own filters, so enable Attachments there too to see the sessions linked to a memory note.
 
 ## How it works
 
