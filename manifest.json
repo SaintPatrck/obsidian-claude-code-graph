@@ -1,7 +1,7 @@
 {
   "id": "claude-code-graph",
   "name": "Claude Code Graph",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "minAppVersion": "1.4.0",
   "description": "Links each Claude Code project to its memories and sessions, each session to its subagents, metadata, and tool results, and colors the graph by node type.",
   "author": "saintpatrck",
