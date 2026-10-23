@@ -16,6 +16,10 @@ const { Plugin, TFile, TFolder, Vault } = require("obsidian");
 // nodes; writing the entry directly (rather than through saveFileCache) keeps
 // it out of the persisted IndexedDB cache.
 //
+// Graph labels default to file names, which for transcripts are opaque ids, so
+// nodes are relabeled with session titles, agent descriptions, workflow names,
+// and project paths relative to the home directory.
+//
 // Graph color groups never apply to attachments, which covers every node type
 // here, so node colors are assigned as the data reaches each graph renderer.
 
@@ -45,10 +49,22 @@ const MEMORY_SCAN_DELAY_MS = 2000;
 // read several at a time, and results are saved and applied per batch.
 const SCAN_CONCURRENCY = 8;
 const SCAN_BATCH_SIZE = 200;
+const TITLE_SCAN_DELAY_MS = 30000;
 // Bump when the fields extracted per transcript change, so stale entries are
 // read again instead of trusted.
-const TRANSCRIPT_CACHE_VERSION = 1;
+const TRANSCRIPT_CACHE_VERSION = 3;
 const MEMORY_WRITE = /"name":"(?:Write|Edit|MultiEdit)","input":\{"file_path":"([^"]+\/memory\/[^"/]+\.md)"/g;
+// A session's latest record of each kind wins, in this order of preference.
+const SESSION_TITLES = [
+  /"type":"custom-title","customTitle":"((?:[^"\\]|\\.)*)"/g,
+  /"type":"ai-title","aiTitle":"((?:[^"\\]|\\.)*)"/g,
+  /"type":"last-prompt","lastPrompt":"((?:[^"\\]|\\.)*)"/g,
+];
+const LABEL_MAX_LENGTH = 48;
+const SESSION_CWD = /"cwd":"((?:[^"\\]|\\.)*)"/g;
+// Worktree layouts in use: <repo>/.claude/worktrees/<name>,
+// <repo>.worktrees/<name>, and <parent>/.worktrees/<name>.
+const WORKTREE = /^(.*?)(?:\/\.claude\/worktrees|\.worktrees|\/\.worktrees)\/([^/]+)$/;
 
 module.exports = class ClaudeCodeGraph extends Plugin {
   async onload() {
@@ -56,6 +72,8 @@ module.exports = class ClaudeCodeGraph extends Plugin {
     this.injectedNodes = new Map();
     this.origins = new Map();
     this.agentTypes = new Map();
+    this.labels = new Map();
+    this.projectNames = new Map();
     this.memoryWriters = new Map();
     this.patchedRenderers = new Map();
     this.syncing = false;
@@ -64,12 +82,13 @@ module.exports = class ClaudeCodeGraph extends Plugin {
       this.patchRenderers();
       this.sync();
       this.resolveOrigins();
-      this.loadAgentTypes();
-      this.scanMemoryWrites();
+      this.loadMetadata();
+      this.scanTranscripts();
       this.registerEvent(this.app.metadataCache.on("resolved", () => this.sync()));
       this.registerEvent(this.app.vault.on("create", (file) => this.onCreate(file)));
       this.registerEvent(this.app.vault.on("modify", (file) => {
-        if (this.isMemory(file.path)) this.scheduleMemoryScan();
+        if (this.isMemory(file.path)) this.scheduleScan(MEMORY_SCAN_DELAY_MS);
+        else if (this.category(file.path) === "session") this.scheduleScan(TITLE_SCAN_DELAY_MS);
       }));
       this.registerEvent(this.app.vault.on("delete", (file) => this.onRemove(file.path)));
       this.registerEvent(this.app.vault.on("rename", (file, oldPath) => this.onRemove(oldPath, file)));
@@ -81,8 +100,12 @@ module.exports = class ClaudeCodeGraph extends Plugin {
 
   onunload() {
     clearTimeout(this.originTimer);
-    clearTimeout(this.memoryTimer);
-    for (const [renderer, setData] of this.patchedRenderers) renderer.setData = setData;
+    clearTimeout(this.scanTimer);
+    if (this.labelPatch) this.labelPatch.proto.getDisplayText = this.labelPatch.getDisplayText;
+    for (const [renderer, setData] of this.patchedRenderers) {
+      renderer.setData = setData;
+      if (this.labelPatch) this.relabel(renderer);
+    }
     this.patchedRenderers.clear();
     this.clear();
     this.app.metadataCache.trigger("resolved");
@@ -95,8 +118,9 @@ module.exports = class ClaudeCodeGraph extends Plugin {
       clearTimeout(this.originTimer);
       this.originTimer = setTimeout(() => this.resolveOrigins(), ORIGIN_RETRY_DELAY_MS);
     }
-    if (this.isMemory(file.path)) this.scheduleMemoryScan();
-    if (this.category(file.path) === "meta") this.readAgentType(file.path).then(() => this.sync());
+    if (this.isMemory(file.path)) this.scheduleScan(MEMORY_SCAN_DELAY_MS);
+    if (this.category(file.path) === "meta") this.readAgentMeta(file.path).then(() => this.sync());
+    else if (this.isRunRecord(file.path)) this.readRunRecord(file.path).then(() => this.sync());
     else this.sync();
   }
 
@@ -142,31 +166,74 @@ module.exports = class ClaudeCodeGraph extends Plugin {
     return null;
   }
 
-  async loadAgentTypes() {
-    const metas = this.app.vault.getFiles().filter((f) => f.name.endsWith(".meta.json") && this.category(f.path) === "meta");
-    await Promise.all(metas.map((f) => this.readAgentType(f.path)));
+  isRunRecord(path) {
+    return path.split("/")[2] === "workflows" && path.endsWith(".json") && this.workflowParts(path) !== null;
+  }
+
+  async loadMetadata() {
+    const files = this.app.vault.getFiles();
+    await Promise.all([
+      ...files.filter((f) => f.name.endsWith(".meta.json") && this.category(f.path) === "meta").map((f) => this.readAgentMeta(f.path)),
+      ...files.filter((f) => this.isRunRecord(f.path)).map((f) => this.readRunRecord(f.path)),
+    ]);
     this.sync();
   }
 
-  async readAgentType(metaPath) {
+  async readJson(path) {
     try {
-      const { agentType } = JSON.parse(await this.app.vault.adapter.read(metaPath));
-      if (agentType) this.agentTypes.set(this.agentLogFor(metaPath), agentType);
+      return JSON.parse(await this.app.vault.adapter.read(path));
     } catch {
-      // A metadata file caught mid-write keeps its agent's default color.
+      // A file caught mid-write is read again when it is next created.
+      return {};
     }
   }
 
-  scheduleMemoryScan() {
-    clearTimeout(this.memoryTimer);
-    this.memoryTimer = setTimeout(() => this.scanMemoryWrites(), MEMORY_SCAN_DELAY_MS);
+  async readAgentMeta(metaPath) {
+    const { agentType, description } = await this.readJson(metaPath);
+    const agentPath = this.agentLogFor(metaPath);
+    if (agentType) this.agentTypes.set(agentPath, agentType);
+    if (description) this.labels.set(agentPath, description);
   }
 
-  // Reading every transcript is slow, so each log's memory writes are cached
-  // in plugin data and a log is only read again once its size or mtime moves.
-  // Batches are saved as they finish, so links appear while a cold scan runs
-  // and a scan cut short keeps its progress.
-  async scanMemoryWrites() {
+  async readRunRecord(recordPath) {
+    const { workflowName, summary } = await this.readJson(recordPath);
+    const label = workflowName || summary;
+    if (label) this.labels.set(this.workflowParts(recordPath).run, label);
+  }
+
+  // A pending scan is never pushed later, so a session that keeps writing
+  // still gets rescanned on schedule.
+  scheduleScan(delay) {
+    const due = Date.now() + delay;
+    if (this.scanTimer && this.scanDue <= due) return;
+    clearTimeout(this.scanTimer);
+    this.scanDue = due;
+    this.scanTimer = setTimeout(() => {
+      this.scanTimer = null;
+      this.scanTranscripts();
+    }, delay);
+  }
+
+  sessionTitle(content) {
+    for (const pattern of SESSION_TITLES) {
+      let last = null;
+      for (const [, title] of content.matchAll(pattern)) last = title;
+      if (last === null) continue;
+      try {
+        return JSON.parse(`"${last}"`);
+      } catch {
+        // Fall through to the next kind of title.
+      }
+    }
+    return null;
+  }
+
+  // Reading every transcript is slow, so what each log contributes (memory
+  // writes, session title) is cached in plugin data and a log is only read
+  // again once its size or mtime moves. Batches are saved as they finish, so
+  // results appear while a cold scan runs and a scan cut short keeps its
+  // progress.
+  async scanTranscripts() {
     if (this.scanning) {
       this.scanAgain = true;
       return;
@@ -203,7 +270,7 @@ module.exports = class ClaudeCodeGraph extends Plugin {
     }
     if (this.scanAgain) {
       this.scanAgain = false;
-      this.scanMemoryWrites();
+      this.scanTranscripts();
     }
   }
 
@@ -216,23 +283,126 @@ module.exports = class ClaudeCodeGraph extends Plugin {
         if (target.startsWith(`${base}/`)) targets.add(target.slice(base.length + 1));
       }
     }
-    return { size, mtime, targets: [...targets] };
+    const session = this.category(file.path) === "session";
+    const title = session ? this.sessionTitle(content) : null;
+    const cwd = session ? this.sessionCwd(content, file.path.split("/")[0]) : null;
+    return { size, mtime, targets: [...targets], title, cwd };
+  }
+
+  // Claude Code names a project folder by its working directory with every
+  // non-alphanumeric character turned into a dash, so a session's cwd that
+  // encodes to its folder name is the project's real path. Sessions in a
+  // moved repo only record the new path, which is kept as a fallback.
+  sessionCwd(content, project) {
+    let first = null;
+    for (const [, raw] of content.matchAll(SESSION_CWD)) {
+      let cwd;
+      try {
+        cwd = JSON.parse(`"${raw}"`);
+      } catch {
+        continue;
+      }
+      if (cwd.replace(/[^a-zA-Z0-9]/g, "-") === project) return cwd;
+      first ??= cwd;
+    }
+    return first;
+  }
+
+  // A project whose sessions were all deleted has no cwd, but its folder
+  // usually extends a known project's encoded path, so the remainder is the
+  // directory name beneath it.
+  inferProjectPaths(cwds) {
+    const known = [...cwds.values()].map((cwd) => [cwd, cwd.replace(/[^a-zA-Z0-9]/g, "-")]);
+    for (const folder of this.app.vault.getRoot().children) {
+      if (!(folder instanceof TFolder) || folder.name.startsWith(".") || cwds.has(folder.name)) continue;
+      let best = null;
+      for (const [cwd, encoded] of known) {
+        if (folder.name.startsWith(`${encoded}-`) && (!best || encoded.length > best[1].length)) best = [cwd, encoded];
+      }
+      if (best) cwds.set(folder.name, `${best[0]}/${folder.name.slice(best[1].length + 1)}`);
+    }
+  }
+
+  // Projects are named by their directory, with a worktree's name alongside
+  // its repo, and widened to the parent directory when two names collide.
+  nameProjects(cwds) {
+    const entries = [...cwds].map(([project, cwd]) => {
+      let [, repo, worktree] = cwd.match(WORKTREE) ?? [null, cwd, null];
+      // A worktree session that only recorded its repo root still has the
+      // worktree in its folder name.
+      if (!worktree && cwd.replace(/[^a-zA-Z0-9]/g, "-") !== project) {
+        worktree = project.match(/--(?:claude-)?worktrees-(.+)$/)?.[1] ?? null;
+      }
+      return { project, segments: repo.split("/").filter(Boolean), worktree };
+    });
+    const format = (entry, depth) => {
+      const name = entry.segments.slice(-depth).join("/") || "/";
+      return entry.worktree ? `${name} (${entry.worktree})` : name;
+    };
+    const counts = new Map();
+    for (const entry of entries) counts.set(format(entry, 1), (counts.get(format(entry, 1)) ?? 0) + 1);
+    return new Map(entries.map((entry) => [entry.project, format(entry, counts.get(format(entry, 1)) > 1 ? 2 : 1)]));
   }
 
   applyScan(scanned) {
     this.memoryWriters = new Map();
-    for (const [log, { targets }] of Object.entries(scanned)) {
+    const cwds = new Map();
+    for (const [log, { targets, title, cwd }] of Object.entries(scanned)) {
+      if (title) this.labels.set(log, title);
+      const project = log.split("/")[0];
+      if (cwd && (!cwds.has(project) || cwd.replace(/[^a-zA-Z0-9]/g, "-") === project)) cwds.set(project, cwd);
       for (const target of targets) {
         if (!this.memoryWriters.has(target)) this.memoryWriters.set(target, new Set());
         this.memoryWriters.get(target).add(log);
       }
     }
+    this.inferProjectPaths(cwds);
+    this.projectNames = this.nameProjects(cwds);
     this.sync();
   }
 
   agentLogFor(sidecarPath) {
     const slash = sidecarPath.lastIndexOf("/");
     return `${sidecarPath.slice(0, slash + 1)}${sidecarPath.slice(slash + 1).split(".")[0]}.jsonl`;
+  }
+
+  label(path) {
+    let label = this.labels.get(path);
+    if (!label && this.injectedNodes.has(path) && !path.includes("/")) {
+      label = this.projectNames.get(path) ?? this.projectLabel(path);
+    }
+    if (!label) return null;
+    label = label.replace(/\s+/g, " ").trim();
+    return label.length > LABEL_MAX_LENGTH ? `${label.slice(0, LABEL_MAX_LENGTH - 3)}...` : label;
+  }
+
+  // Without a recorded cwd, the folder name minus the encoded home directory
+  // is the best available label.
+  projectLabel(path) {
+    const home = this.app.vault.adapter.getBasePath?.()?.replace(/\/\.claude\/projects\/?$/, "");
+    const prefix = home ? `${home.replace(/[^a-zA-Z0-9]/g, "-")}-` : null;
+    return prefix && path.startsWith(prefix) ? path.slice(prefix.length) : null;
+  }
+
+  // Graph nodes share one class, so its getDisplayText is wrapped once and
+  // text already drawn is refreshed in place.
+  relabel(renderer) {
+    const first = renderer.nodes && renderer.nodes[0];
+    if (!first) return;
+    if (!this.labelPatch) {
+      const proto = Object.getPrototypeOf(first);
+      const getDisplayText = proto.getDisplayText;
+      const plugin = this;
+      proto.getDisplayText = function () {
+        return plugin.label(this.id) ?? getDisplayText.call(this);
+      };
+      this.labelPatch = { proto, getDisplayText };
+    }
+    for (const node of renderer.nodes) {
+      if (!node.text) continue;
+      const text = node.getDisplayText();
+      if (node.text.text !== text) node.text.text = text;
+    }
   }
 
   color(path, category) {
@@ -305,7 +475,9 @@ module.exports = class ClaudeCodeGraph extends Plugin {
         const setData = renderer.setData;
         renderer.setData = (data) => {
           this.decorate(data);
-          return setData.call(renderer, data);
+          const result = setData.call(renderer, data);
+          this.relabel(renderer);
+          return result;
         };
         this.patchedRenderers.set(renderer, setData);
         patched = true;

@@ -44,6 +44,10 @@ Obsidian's graph color groups don't apply to attachments, which covers every fil
 
 Memory notes are left alone, so graph color groups still work for them. Subagents are colored by the `agentType` recorded in their metadata. To change the palette, edit the `COLORS` and `AGENT_COLORS` blocks at the top of `main.js`.
 
+## Labels
+
+Transcript file names are opaque ids, so graph labels show something readable instead. Sessions use their custom title, then their AI-generated title, then their latest prompt. Subagents use the description they were spawned with, workflow runs use their workflow name, and projects show their directory name as recorded in their sessions (or inferred from a parent project once their sessions are deleted), with a worktree's name in parentheses and the parent directory added when two projects share a name. Memory notes and other files keep their file names.
+
 ## Node size
 
 In the global graph, session and subagent nodes grow with their transcript's size on disk, so the longest conversations stand out even when they spawned little. Every other node keeps Obsidian's usual sizing by link count, and the local graph keeps its sizing by distance from the focused note.
