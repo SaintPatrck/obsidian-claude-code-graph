@@ -65,6 +65,11 @@ const SESSION_CWD = /"cwd":"((?:[^"\\]|\\.)*)"/g;
 // Worktree layouts in use: <repo>/.claude/worktrees/<name>,
 // <repo>.worktrees/<name>, and <parent>/.worktrees/<name>.
 const WORKTREE = /^(.*?)(?:\/\.claude\/worktrees|\.worktrees|\/\.worktrees)\/([^/]+)$/;
+// Claude Code deletes transcripts after 30 days by default, so files fade
+// toward that horizon by last modification.
+const FADE_DAYS = 30;
+const FADE_MIN_ALPHA = 0.3;
+const DAY_MS = 24 * 60 * 60 * 1000;
 
 module.exports = class ClaudeCodeGraph extends Plugin {
   async onload() {
@@ -405,6 +410,13 @@ module.exports = class ClaudeCodeGraph extends Plugin {
     }
   }
 
+  alpha(path) {
+    const file = this.app.vault.getAbstractFileByPath(path);
+    if (!(file instanceof TFile)) return 1;
+    const age = Math.min(Math.max((Date.now() - file.stat.mtime) / (FADE_DAYS * DAY_MS), 0), 1);
+    return 1 - (1 - FADE_MIN_ALPHA) * age;
+  }
+
   color(path, category) {
     if (category !== "subagent") return COLORS[category];
     const type = this.agentTypes.get(path);
@@ -492,7 +504,7 @@ module.exports = class ClaudeCodeGraph extends Plugin {
       const node = data.nodes[id];
       if (node.type !== "attachment") continue;
       const category = this.category(id);
-      if (category) node.color = { a: 1, rgb: this.color(id, category) };
+      if (category) node.color = { a: this.alpha(id), rgb: this.color(id, category) };
     }
     // The local graph supplies its own weights to size nodes by depth.
     if (!data.weights) data.weights = this.weights(data.nodes);
