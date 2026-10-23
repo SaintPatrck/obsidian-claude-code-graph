@@ -41,6 +41,10 @@ const AGENT_COLORS = {
 const ORIGIN_RETRY_DELAY_MS = 5000;
 const TRANSCRIPT_BYTES_PER_WEIGHT = 256 * 1024;
 const MEMORY_SCAN_DELAY_MS = 2000;
+// Each await can wait out a frame of a busy graph view, so transcripts are
+// read several at a time, and results are saved and applied per batch.
+const SCAN_CONCURRENCY = 8;
+const SCAN_BATCH_SIZE = 200;
 // Bump when the fields extracted per transcript change, so stale entries are
 // read again instead of trusted.
 const TRANSCRIPT_CACHE_VERSION = 1;
@@ -160,6 +164,8 @@ module.exports = class ClaudeCodeGraph extends Plugin {
 
   // Reading every transcript is slow, so each log's memory writes are cached
   // in plugin data and a log is only read again once its size or mtime moves.
+  // Batches are saved as they finish, so links appear while a cold scan runs
+  // and a scan cut short keeps its progress.
   async scanMemoryWrites() {
     if (this.scanning) {
       this.scanAgain = true;
@@ -172,34 +178,26 @@ module.exports = class ClaudeCodeGraph extends Plugin {
       const data = (await this.loadData()) ?? {};
       const cached = data.transcripts?.version === TRANSCRIPT_CACHE_VERSION ? data.transcripts.logs : {};
       const scanned = {};
+      const stale = [];
       for (const file of this.app.vault.getFiles()) {
         const category = this.category(file.path);
         if (category !== "session" && category !== "subagent") continue;
-        const { size, mtime } = file.stat;
         const hit = cached[file.path];
-        if (hit && hit.size === size && hit.mtime === mtime) {
-          scanned[file.path] = hit;
-          continue;
-        }
-        const content = await this.app.vault.adapter.read(file.path);
-        const targets = new Set();
-        if (content.includes("/memory/")) {
-          for (const [, target] of content.matchAll(MEMORY_WRITE)) {
-            if (target.startsWith(`${base}/`)) targets.add(target.slice(base.length + 1));
-          }
-        }
-        scanned[file.path] = { size, mtime, targets: [...targets] };
+        if (hit && hit.size === file.stat.size && hit.mtime === file.stat.mtime) scanned[file.path] = hit;
+        else stale.push(file);
       }
-      await this.saveData({ ...data, transcripts: { version: TRANSCRIPT_CACHE_VERSION, logs: scanned } });
+      this.applyScan(scanned);
 
-      this.memoryWriters = new Map();
-      for (const [log, { targets }] of Object.entries(scanned)) {
-        for (const target of targets) {
-          if (!this.memoryWriters.has(target)) this.memoryWriters.set(target, new Set());
-          this.memoryWriters.get(target).add(log);
+      for (let i = 0; i < stale.length; i += SCAN_BATCH_SIZE) {
+        const batch = stale.slice(i, i + SCAN_BATCH_SIZE);
+        for (let j = 0; j < batch.length; j += SCAN_CONCURRENCY) {
+          await Promise.all(batch.slice(j, j + SCAN_CONCURRENCY).map(async (file) => {
+            scanned[file.path] = await this.scanTranscript(file, base);
+          }));
         }
+        await this.saveData({ ...data, transcripts: { version: TRANSCRIPT_CACHE_VERSION, logs: scanned } });
+        this.applyScan(scanned);
       }
-      this.sync();
     } finally {
       this.scanning = false;
     }
@@ -207,6 +205,29 @@ module.exports = class ClaudeCodeGraph extends Plugin {
       this.scanAgain = false;
       this.scanMemoryWrites();
     }
+  }
+
+  async scanTranscript(file, base) {
+    const { size, mtime } = file.stat;
+    const content = await this.app.vault.adapter.read(file.path);
+    const targets = new Set();
+    if (content.includes("/memory/")) {
+      for (const [, target] of content.matchAll(MEMORY_WRITE)) {
+        if (target.startsWith(`${base}/`)) targets.add(target.slice(base.length + 1));
+      }
+    }
+    return { size, mtime, targets: [...targets] };
+  }
+
+  applyScan(scanned) {
+    this.memoryWriters = new Map();
+    for (const [log, { targets }] of Object.entries(scanned)) {
+      for (const target of targets) {
+        if (!this.memoryWriters.has(target)) this.memoryWriters.set(target, new Set());
+        this.memoryWriters.get(target).add(log);
+      }
+    }
+    this.sync();
   }
 
   color(path, category) {
