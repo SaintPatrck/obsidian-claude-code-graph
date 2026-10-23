@@ -46,7 +46,7 @@ Memory notes are left alone, so graph color groups still work for them. Subagent
 
 ## Labels
 
-Transcript file names are opaque ids, so graph labels show something readable instead. Sessions use their custom title, then their AI-generated title, then their latest prompt. Subagents use the description they were spawned with, workflow runs use their workflow name, and projects show their path relative to your home directory. Memory notes and other files keep their file names.
+Transcript file names are opaque ids, so graph labels show something readable instead. Sessions use their custom title, then their AI-generated title, then their latest prompt. Subagents use the description they were spawned with, workflow runs use their workflow name, and projects show their directory name as recorded in their sessions, with a worktree's name in parentheses and the parent directory added when two projects share a name. Memory notes and other files keep their file names.
 
 ## Node size
 

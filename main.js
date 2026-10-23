@@ -52,7 +52,7 @@ const SCAN_BATCH_SIZE = 200;
 const TITLE_SCAN_DELAY_MS = 30000;
 // Bump when the fields extracted per transcript change, so stale entries are
 // read again instead of trusted.
-const TRANSCRIPT_CACHE_VERSION = 2;
+const TRANSCRIPT_CACHE_VERSION = 3;
 const MEMORY_WRITE = /"name":"(?:Write|Edit|MultiEdit)","input":\{"file_path":"([^"]+\/memory\/[^"/]+\.md)"/g;
 // A session's latest record of each kind wins, in this order of preference.
 const SESSION_TITLES = [
@@ -61,6 +61,10 @@ const SESSION_TITLES = [
   /"type":"last-prompt","lastPrompt":"((?:[^"\\]|\\.)*)"/g,
 ];
 const LABEL_MAX_LENGTH = 48;
+const SESSION_CWD = /"cwd":"((?:[^"\\]|\\.)*)"/g;
+// Worktree layouts in use: <repo>/.claude/worktrees/<name>,
+// <repo>.worktrees/<name>, and <parent>/.worktrees/<name>.
+const WORKTREE = /^(.*?)(?:\/\.claude\/worktrees|\.worktrees|\/\.worktrees)\/([^/]+)$/;
 
 module.exports = class ClaudeCodeGraph extends Plugin {
   async onload() {
@@ -69,6 +73,7 @@ module.exports = class ClaudeCodeGraph extends Plugin {
     this.origins = new Map();
     this.agentTypes = new Map();
     this.labels = new Map();
+    this.projectNames = new Map();
     this.memoryWriters = new Map();
     this.patchedRenderers = new Map();
     this.syncing = false;
@@ -278,19 +283,65 @@ module.exports = class ClaudeCodeGraph extends Plugin {
         if (target.startsWith(`${base}/`)) targets.add(target.slice(base.length + 1));
       }
     }
-    const title = this.category(file.path) === "session" ? this.sessionTitle(content) : null;
-    return { size, mtime, targets: [...targets], title };
+    const session = this.category(file.path) === "session";
+    const title = session ? this.sessionTitle(content) : null;
+    const cwd = session ? this.sessionCwd(content, file.path.split("/")[0]) : null;
+    return { size, mtime, targets: [...targets], title, cwd };
+  }
+
+  // Claude Code names a project folder by its working directory with every
+  // non-alphanumeric character turned into a dash, so a session's cwd that
+  // encodes to its folder name is the project's real path. Sessions in a
+  // moved repo only record the new path, which is kept as a fallback.
+  sessionCwd(content, project) {
+    let first = null;
+    for (const [, raw] of content.matchAll(SESSION_CWD)) {
+      let cwd;
+      try {
+        cwd = JSON.parse(`"${raw}"`);
+      } catch {
+        continue;
+      }
+      if (cwd.replace(/[^a-zA-Z0-9]/g, "-") === project) return cwd;
+      first ??= cwd;
+    }
+    return first;
+  }
+
+  // Projects are named by their directory, with a worktree's name alongside
+  // its repo, and widened to the parent directory when two names collide.
+  nameProjects(cwds) {
+    const entries = [...cwds].map(([project, cwd]) => {
+      let [, repo, worktree] = cwd.match(WORKTREE) ?? [null, cwd, null];
+      // A worktree session that only recorded its repo root still has the
+      // worktree in its folder name.
+      if (!worktree && cwd.replace(/[^a-zA-Z0-9]/g, "-") !== project) {
+        worktree = project.match(/--(?:claude-)?worktrees-(.+)$/)?.[1] ?? null;
+      }
+      return { project, segments: repo.split("/").filter(Boolean), worktree };
+    });
+    const format = (entry, depth) => {
+      const name = entry.segments.slice(-depth).join("/") || "/";
+      return entry.worktree ? `${name} (${entry.worktree})` : name;
+    };
+    const counts = new Map();
+    for (const entry of entries) counts.set(format(entry, 1), (counts.get(format(entry, 1)) ?? 0) + 1);
+    return new Map(entries.map((entry) => [entry.project, format(entry, counts.get(format(entry, 1)) > 1 ? 2 : 1)]));
   }
 
   applyScan(scanned) {
     this.memoryWriters = new Map();
-    for (const [log, { targets, title }] of Object.entries(scanned)) {
+    const cwds = new Map();
+    for (const [log, { targets, title, cwd }] of Object.entries(scanned)) {
       if (title) this.labels.set(log, title);
+      const project = log.split("/")[0];
+      if (cwd && (!cwds.has(project) || cwd.replace(/[^a-zA-Z0-9]/g, "-") === project)) cwds.set(project, cwd);
       for (const target of targets) {
         if (!this.memoryWriters.has(target)) this.memoryWriters.set(target, new Set());
         this.memoryWriters.get(target).add(log);
       }
     }
+    this.projectNames = this.nameProjects(cwds);
     this.sync();
   }
 
@@ -301,14 +352,16 @@ module.exports = class ClaudeCodeGraph extends Plugin {
 
   label(path) {
     let label = this.labels.get(path);
-    if (!label && this.injectedNodes.has(path) && !path.includes("/")) label = this.projectLabel(path);
+    if (!label && this.injectedNodes.has(path) && !path.includes("/")) {
+      label = this.projectNames.get(path) ?? this.projectLabel(path);
+    }
     if (!label) return null;
     label = label.replace(/\s+/g, " ").trim();
     return label.length > LABEL_MAX_LENGTH ? `${label.slice(0, LABEL_MAX_LENGTH - 3)}...` : label;
   }
 
-  // Claude Code names a project folder by its path with every
-  // non-alphanumeric character turned into a dash.
+  // Without a recorded cwd, the folder name minus the encoded home directory
+  // is the best available label.
   projectLabel(path) {
     const home = this.app.vault.adapter.getBasePath?.()?.replace(/\/\.claude\/projects\/?$/, "");
     const prefix = home ? `${home.replace(/[^a-zA-Z0-9]/g, "-")}-` : null;
