@@ -38,6 +38,7 @@ const AGENT_COLORS = {
 };
 
 const ORIGIN_RETRY_DELAY_MS = 5000;
+const TRANSCRIPT_BYTES_PER_WEIGHT = 256 * 1024;
 
 module.exports = class ClaudeCodeGraph extends Plugin {
   async onload() {
@@ -203,7 +204,7 @@ module.exports = class ClaudeCodeGraph extends Plugin {
         if (!renderer || this.patchedRenderers.has(renderer)) continue;
         const setData = renderer.setData;
         renderer.setData = (data) => {
-          this.colorize(data);
+          this.decorate(data);
           return setData.call(renderer, data);
         };
         this.patchedRenderers.set(renderer, setData);
@@ -213,7 +214,7 @@ module.exports = class ClaudeCodeGraph extends Plugin {
     return patched;
   }
 
-  colorize(data) {
+  decorate(data) {
     if (!data || !data.nodes) return;
     for (const id in data.nodes) {
       const node = data.nodes[id];
@@ -221,6 +222,30 @@ module.exports = class ClaudeCodeGraph extends Plugin {
       const category = this.category(id);
       if (category) node.color = { a: 1, rgb: this.color(id, category) };
     }
+    // The local graph supplies its own weights to size nodes by depth.
+    if (!data.weights) data.weights = this.weights(data.nodes);
+  }
+
+  // Without weights Obsidian sizes each node by its link count. Transcripts
+  // take the larger of that and their size on disk, so a long session or
+  // subagent reads as heavy even when it spawned little.
+  weights(nodes) {
+    const weights = {};
+    for (const id in nodes) weights[id] = 0;
+    for (const id in nodes) {
+      for (const target in nodes[id].links) {
+        if (!Object.hasOwn(nodes, target)) continue;
+        weights[id]++;
+        weights[target]++;
+      }
+    }
+    for (const id in weights) {
+      const category = this.category(id);
+      if (category !== "session" && category !== "subagent") continue;
+      const file = this.app.vault.getAbstractFileByPath(id);
+      if (file instanceof TFile) weights[id] = Math.max(weights[id], file.stat.size / TRANSCRIPT_BYTES_PER_WEIGHT);
+    }
+    return weights;
   }
 
   collect() {

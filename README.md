@@ -44,6 +44,10 @@ Obsidian's graph color groups don't apply to attachments, which covers every fil
 
 Memory notes are left alone, so graph color groups still work for them. Subagents are colored by the `agentType` recorded in their metadata. To change the palette, edit the `COLORS` and `AGENT_COLORS` blocks at the top of `main.js`.
 
+## Node size
+
+In the global graph, session and subagent nodes grow with their transcript's size on disk, so the longest conversations stand out even when they spawned little. Every other node keeps Obsidian's usual sizing by link count, and the local graph keeps its sizing by distance from the focused note.
+
 ## Installation
 
 Open `~/.claude/projects` as an Obsidian vault, then install with [BRAT](https://github.com/TfTHacker/obsidian42-brat), which also keeps the plugin updated:
