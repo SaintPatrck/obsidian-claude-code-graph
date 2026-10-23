@@ -32,7 +32,7 @@ const COLORS = {
 // Subagents are colored by the agentType in their metadata. Types not listed
 // fall back to pluginAgent when namespaced by a plugin, otherwise subagent.
 const AGENT_COLORS = {
-  "workflow-subagent": 0x6366f1,
+  "workflow-subagent": 0xc4b5fd,
   Explore: 0x22d3ee,
   Plan: 0x22d3ee,
 };

@@ -36,7 +36,7 @@ Obsidian's graph color groups don't apply to attachments, which covers every fil
 | Run record, script, or journal | Light pink |
 | Session | Blue |
 | General-purpose or other subagent | Violet |
-| Workflow agent | Indigo |
+| Workflow agent | Lavender |
 | Explore or Plan agent | Cyan |
 | Plugin agent (any `plugin:agent` type) | Red |
 | Agent metadata | Teal |
