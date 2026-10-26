@@ -4,6 +4,8 @@ An Obsidian plugin that turns a vault rooted at `~/.claude/projects` into a conn
 
 Claude Code stores each project's memories, session transcripts, subagent transcripts, and persisted tool output as plain files. Obsidian only draws graph edges from links inside Markdown notes, so out of the box those files show up as hundreds of disconnected attachment nodes. This plugin derives the relationships from Claude Code's directory layout and transcript contents and adds them to the graph, without writing anything to disk.
 
+![Obsidian graph view of a Claude Code history, with amber project hubs, blue sessions, and clusters of subagents and tool results around them](docs/graph.png)
+
 ## Graph structure
 
 ```
